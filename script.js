@@ -1310,7 +1310,7 @@ function renderQuickSalesGrid() {
     keys.forEach(id => {
         const item = localCatalog[id];
         grid.innerHTML += `
-            <div onclick="openSmartModal('sale_catalog', '${id}')" class="bg-gray-900 border border-gray-700 rounded-xl p-3 cursor-pointer hover:border-red-500 transition min-h-[100px] flex flex-col justify-between shadow-md">
+            <div onclick="openSmartModal('sale_catalog', '${id}')" class="bg-gray-900 border border-gray-700 rounded-2xl p-4 cursor-pointer hover:border-red-500 transition min-h-[100px] flex flex-col justify-between shadow-md">
                 <span class="text-sm font-bold text-amber-400 leading-tight">${item.name}</span>
                 <span class="text-xs text-emerald-400 font-semibold mt-2">${formatValuta(item.price)}</span>
             </div>
@@ -1571,6 +1571,13 @@ function renderInventoryGrid() {
     let items = Object.keys(localInventory).map(k => ({ id: k, ...localInventory[k] }));
     if (stashVal !== 'all') items = items.filter(i => i.stash === stashVal);
     if (searchVal) items = items.filter(i => (i.name || '').toLowerCase().includes(searchVal));
+    // Ordina: per nome deposito, poi per nome oggetto
+    items.sort((a, b) => {
+        const sa = (getStashName(a.stash) || '').toLowerCase();
+        const sb = (getStashName(b.stash) || '').toLowerCase();
+        if (sa !== sb) return sa.localeCompare(sb, 'it');
+        return (a.name || '').toLowerCase().localeCompare((b.name || '').toLowerCase(), 'it');
+    });
     if (items.length === 0) {
         grid.innerHTML = '<div class="col-span-full text-center py-6 text-gray-500 text-sm">Nessun oggetto in inventario.</div>';
         return;
@@ -1581,18 +1588,20 @@ function renderInventoryGrid() {
         const safeName = (item.name || '').replace(/'/g, "\\'").replace(/"/g, '&quot;');
         const delHidden = userRole !== 'gestore' ? 'hidden' : '';
         const imgSrc = item.imageUrl || 'https://via.placeholder.com/150?text=No+Immagine';
+        const stashLabel = getStashName(item.stash) || '—';
         tpl.innerHTML =
-            '<div onclick="openSmartModal(\'inv\', \'' + item.id + '\')" class="relative bg-gray-800 rounded-xl border border-gray-700 overflow-hidden shadow-lg flex flex-col group cursor-pointer hover:border-amber-500 transition-all inv-card">' +
+            '<div onclick="openSmartModal(\'inv\', \'' + item.id + '\')" class="relative bg-gray-800 rounded-2xl border border-gray-700 overflow-hidden shadow-lg flex flex-col group cursor-pointer hover:border-amber-500 transition-all inv-card min-h-[200px]">' +
             '<button onclick="event.stopPropagation(); window.deleteInventoryItem(\'' + item.id + '\', \'' + safeName + '\')" class="absolute top-2 right-2 p-1.5 bg-red-600/90 hover:bg-red-700 text-white rounded-lg text-xs z-20 ' + delHidden + '" title="Rimuovi">' +
             '<i class="fa-solid fa-trash"></i></button>' +
-            '<div class="h-28 w-full bg-gray-900 flex items-center justify-center p-2">' +
+            '<div class="h-28 w-full bg-gray-900 flex items-center justify-center p-2 shrink-0">' +
             '<img src="' + imgSrc + '" alt="" loading="lazy" decoding="async" width="128" height="128" class="max-h-full max-w-full object-contain drop-shadow-md group-hover:scale-110 transition" onerror="this.onerror=null;this.src=\'https://via.placeholder.com/150?text=No+Immagine\';">' +
             '</div>' +
-            '<div class="p-3 flex-1 flex flex-col justify-between">' +
-            '<h4 class="font-bold text-amber-400 text-sm truncate" title="' + safeName + '">' + (item.name || '') + '</h4>' +
-            '<div class="mt-2 flex justify-between items-end">' +
-            '<span class="text-[10px] text-gray-400 font-semibold bg-gray-700 px-2 py-0.5 rounded">' + getStashName(item.stash) + '</span>' +
-            '<span class="text-emerald-400 font-bold text-sm">Qta: ' + item.quantity + '</span>' +
+            '<div class="p-3 flex-1 flex flex-col gap-2 min-w-0">' +
+            '<h4 class="font-bold text-amber-400 text-sm truncate leading-tight" title="' + safeName + '">' + (item.name || '') + '</h4>' +
+            '<div class="mt-auto flex flex-col gap-1.5 min-w-0">' +
+            '<span class="text-[10px] text-gray-300 font-semibold bg-gray-700/90 px-2 py-1 rounded-lg truncate max-w-full inline-block" title="' + stashLabel.replace(/"/g, '&quot;') + '">' +
+            '<i class="fa-solid fa-warehouse mr-1 text-gray-400"></i>' + stashLabel + '</span>' +
+            '<span class="text-emerald-400 font-bold text-sm whitespace-nowrap">Qta: ' + item.quantity + '</span>' +
             '</div></div></div>';
         while (tpl.firstChild) frag.appendChild(tpl.firstChild);
     });
@@ -2045,6 +2054,7 @@ function getSaldoCassa(id) {
 
 function renderSaldoSection() {
     if (!canAccessSaldo()) return;
+    // Totali sempre globali (soldi effettivamente in cassa)
     [['materiale', 'saldo-materiale'], ['fondo', 'saldo-fondo']].forEach(([id, elId]) => {
         const el = document.getElementById(elId);
         if (!el) return;
@@ -2060,14 +2070,29 @@ function renderSaldoSection() {
     tbody.innerHTML = '';
     if (!localBalanceLogs.length) {
         tbody.innerHTML = '<tr><td colspan="6" class="text-center py-6 text-gray-500 text-xs">Nessun movimento di saldo.</td></tr>';
+        const sumElEmpty = document.getElementById('saldo-filter-summary');
+        if (sumElEmpty) { sumElEmpty.classList.add('hidden'); sumElEmpty.textContent = ''; }
         return;
     }
     const isGestore = userRole === 'gestore';
     const cassaFilter = document.getElementById('saldo-cassa-filter')?.value || 'all';
+    const periodFilter = document.getElementById('saldo-period-filter')?.value || 'all';
+    const weekStart = (typeof getStartOfCurrentWeek === 'function') ? getStartOfCurrentWeek() : 0;
+
+    let filteredCount = 0;
+    let filteredSum = 0;
+
     localBalanceLogs.forEach(log => {
         if (cassaFilter !== 'all' && getLogCassa(log) !== cassaFilter) return;
+        const ts = Number(log.timestamp) || 0;
+        if (periodFilter === 'current' && ts < weekStart) return;
+        if (periodFilter === 'archived' && ts >= weekStart) return;
+
         const amt = Number(log.amount) || 0;
         const isPos = amt >= 0;
+        filteredCount++;
+        filteredSum += amt;
+
         let typeBadge = '';
         switch (log.type) {
             case 'vendita':
@@ -2098,6 +2123,29 @@ function renderSaldoSection() {
                 <td class="py-2 px-2 text-right">${delBtn}</td>
             </tr>`;
     });
+
+    if (filteredCount === 0) {
+        tbody.innerHTML = '<tr><td colspan="6" class="text-center py-6 text-gray-500 text-xs">Nessun movimento per i filtri selezionati.</td></tr>';
+    }
+
+    // Riepilogo filtri (somma movimenti visualizzati)
+    const sumEl = document.getElementById('saldo-filter-summary');
+    if (sumEl) {
+        const cassaLabel = cassaFilter === 'materiale' ? 'Materiale Dinastico'
+            : (cassaFilter === 'fondo' ? 'Fondo Cassa' : 'Tutti i saldi');
+        const periodLabel = periodFilter === 'current' ? 'settimana corrente'
+            : (periodFilter === 'archived' ? 'settimane archiviate / precedenti' : 'tutti i periodi');
+        if (cassaFilter === 'all' && periodFilter === 'all') {
+            sumEl.classList.add('hidden');
+            sumEl.textContent = '';
+        } else {
+            sumEl.classList.remove('hidden');
+            const sumCls = filteredSum >= 0 ? 'text-emerald-400' : 'text-red-400';
+            sumEl.innerHTML = 'Filtro: <b class="text-amber-400">' + cassaLabel + '</b> · <b class="text-amber-400">' + periodLabel + '</b> → '
+                + filteredCount + ' movimenti · somma netta: <b class="' + sumCls + '">'
+                + (filteredSum >= 0 ? '+' : '') + formatValuta(filteredSum) + '</b>';
+        }
+    }
 }
 
 window.deleteSaldoMovimento = function(id) {
@@ -2153,6 +2201,9 @@ document.getElementById('saldo-manual-form')?.addEventListener('submit', (e) => 
 
 // Filtro registro saldi
 document.getElementById('saldo-cassa-filter')?.addEventListener('change', () => {
+    if (typeof renderSaldoSection === 'function') renderSaldoSection();
+});
+document.getElementById('saldo-period-filter')?.addEventListener('change', () => {
     if (typeof renderSaldoSection === 'function') renderSaldoSection();
 });
 

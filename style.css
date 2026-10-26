@@ -388,3 +388,18 @@ h1, h2, h3 { letter-spacing: 0.02em; }
 #admin-section.hidden {
     content-visibility: hidden;
 }
+
+
+/* Inventory card: deposito + quantità sempre ordinati, senza sovrapposizione */
+.inv-card {
+    border-radius: 1rem !important; /* rounded-2xl */
+}
+.inv-card .p-3 {
+    min-width: 0;
+}
+#inventory-grid > div {
+    border-radius: 1rem;
+}
+#quick-sales-grid > div {
+    border-radius: 1rem; /* rounded-2xl */
+}
