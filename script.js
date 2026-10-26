@@ -1319,9 +1319,10 @@ function renderQuickSalesGrid() {
 }
 
 // --- DEPOSITO GIORNALIERO RAPIDO (3000 € su Fondo Cassa) ---
+// Accessibile a gestore e a tutti i membri loggati (anche senza permesso Saldo)
 window.registerDailyDeposit = function() {
-    if (typeof canEditSaldo === 'function' && !canEditSaldo()) {
-        showToast('Non hai il permesso di modificare il saldo (serve accesso Saldo).', 'error');
+    if (!userRole) {
+        showToast('Devi essere autenticato per registrare il deposito.', 'error');
         return;
     }
     showConfirmModal(
