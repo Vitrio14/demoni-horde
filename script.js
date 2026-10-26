@@ -1318,6 +1318,44 @@ function renderQuickSalesGrid() {
     });
 }
 
+// --- DEPOSITO GIORNALIERO RAPIDO (3000 € su Fondo Cassa) ---
+window.registerDailyDeposit = function() {
+    if (typeof canEditSaldo === 'function' && !canEditSaldo()) {
+        showToast('Non hai il permesso di modificare il saldo (serve accesso Saldo).', 'error');
+        return;
+    }
+    showConfirmModal(
+        'Deposito Giornaliero',
+        'Registrare un versamento di 3000 € sul Saldo Fondo Cassa?',
+        () => {
+            const whoName = userRole === 'gestore' ? 'Gestore' : (membriSession?.name || currentEmployeeData?.name || 'Membro');
+            const whoKey = userRole === 'gestore' ? '' : (currentEmployeeId || '');
+            return db.collection('saldo_movimenti').add({
+                timestamp: Date.now(),
+                dateString: new Date().toLocaleString('it-IT'),
+                type: 'versamento',
+                amount: 3000,
+                description: 'Deposito giornaliero',
+                relatedSaleId: null,
+                cassaId: 'fondo',
+                employeeKey: whoKey,
+                employeeName: whoName,
+                createdByRole: userRole,
+                createdByName: whoName
+            }).then(() => {
+                showToast('Deposito giornaliero di 3000 € registrato su Fondo Cassa.', 'success');
+                if (typeof renderSaldoSection === 'function' && isSectionVisible('saldo')) renderSaldoSection();
+            }).catch(err => showToast(err.message || String(err), 'error'));
+        },
+        false
+    );
+};
+
+document.getElementById('daily-deposit-btn')?.addEventListener('click', () => {
+    if (typeof window.registerDailyDeposit === 'function') window.registerDailyDeposit();
+});
+
+
 function renderSalesTable() {
     const tbody = document.getElementById('current-sales-table');
     if (!tbody) return;
