@@ -13,6 +13,22 @@ firebase.initializeApp(firebaseConfig);
 const auth = firebase.auth();
 const db = firebase.firestore();
 
+// Offline persistence: serve from cache first → drasticamente meno letture Firestore (piano free)
+// Le successive aperture del sito leggono dalla cache locale invece che dal server.
+try {
+    db.enablePersistence({ synchronizeTabs: true }).catch(function (err) {
+        if (err.code === 'failed-precondition') {
+            console.warn('[Demoni] Persistence: più tab aperte, solo una attiva');
+        } else if (err.code === 'unimplemented') {
+            console.warn('[Demoni] Persistence non supportata da questo browser');
+        } else {
+            console.warn('[Demoni] Persistence error:', err.code || err);
+        }
+    });
+} catch (e) {
+    console.warn('[Demoni] enablePersistence exception', e);
+}
+
 // Stato Globale
 let currentUser = null;
 let userRole = null; // 'gestore' | 'membro'
@@ -431,7 +447,7 @@ document.getElementById('smart-modal-form').addEventListener('submit', (e) => {
             .catch(err => console.log('Errore controllo manutenzione:', err));
     }
     controllaStatoManutenzione();
-    setInterval(controllaStatoManutenzione, 5000);
+    setInterval(controllaStatoManutenzione, 30000); // 30s invece di 5s (meno richieste inutili)
 })();
 
 const loginMembriForm = document.getElementById('login-membri-form');
@@ -665,7 +681,7 @@ function scheduleUI(fn, delay) {
     _uiQueue.push(fn);
     if (_uiScheduled) return;
     _uiScheduled = true;
-    const wait = (delay && delay > 0) ? delay : 40;
+    const wait = (delay && delay > 0) ? delay : 60;
     setTimeout(function () {
         const batch = _uiQueue.slice();
         _uiQueue = [];
@@ -750,17 +766,48 @@ function showSection(section) {
     scheduleUI(function () { refreshActiveSectionUI(); });
 }
 
-// --- LISTENERS FIRESTORE ---
+// --- LISTENERS FIRESTORE (ottimizzati per piano free) ---
+// Strategia:
+// - Persistence offline già attiva → meno letture server
+// - Listener real-time solo su dati "caldi" (vendite, inventario, movimenti)
+// - Dati statici/raramente cambiati: get() iniziale + listener leggero
+// - Limiti espliciti su log/archivio per non scaricare tutto lo storico
+// - Immagini: caricate una volta (get) e ricaricate solo dopo upload/ottimizza (no onSnapshot permanente)
 let listenersStarted = false;
+let itemImagesLoaded = false;
+
+function loadItemImagesOnce(force) {
+    if (itemImagesLoaded && !force) return Promise.resolve();
+    return db.collection('item_images').get({ source: 'default' })
+        .then(snapshot => {
+            localItemImages = {};
+            snapshot.forEach(doc => { localItemImages[doc.id] = doc.data(); });
+            itemImagesLoaded = true;
+            scheduleUI(function () {
+                if (typeof renderItemImageSelects === 'function') renderItemImageSelects();
+                if (isAdminOpen() && typeof renderItemImagesLibrary === 'function') renderItemImagesLibrary();
+                if (isSectionVisible('inventory') && typeof renderInventoryGrid === 'function') renderInventoryGrid();
+            }, 30);
+        })
+        .catch(err => {
+            console.error('loadItemImagesOnce', err);
+            // fallback cache
+            return db.collection('item_images').get({ source: 'cache' }).then(snapshot => {
+                localItemImages = {};
+                snapshot.forEach(doc => { localItemImages[doc.id] = doc.data(); });
+                itemImagesLoaded = true;
+            }).catch(() => {});
+        });
+}
 
 function initDatabaseListeners() {
     if (listenersStarted) return;
     listenersStarted = true;
 
+    // Employees + catalog: pochi documenti, real-time ok (necessario per permessi e listini)
     db.collection('employees').onSnapshot(snapshot => {
         localEmployees = {};
         snapshot.forEach(doc => { localEmployees[doc.id] = doc.data(); });
-        // Aggiorna ruoli sessione membri se cambia il permesso saldo/altro
         if (userRole === 'membro' && currentEmployeeId && localEmployees[currentEmployeeId]) {
             const emp = localEmployees[currentEmployeeId];
             if (membriSession) {
@@ -788,6 +835,23 @@ function initDatabaseListeners() {
         });
     });
 
+    // Settings singolo documento
+    db.collection('settings').doc('app').onSnapshot(doc => {
+        if (doc.exists) {
+            const d = doc.data() || {};
+            localSettings.defaultMembroPct = (d.defaultMembroPct != null) ? parseFloat(d.defaultMembroPct) : 40;
+            localSettings.defaultDinastiaPct = (d.defaultDinastiaPct != null) ? parseFloat(d.defaultDinastiaPct) : 40;
+        }
+        scheduleUI(function () {
+            if (typeof applySettingsToAdminUI === 'function') applySettingsToAdminUI();
+            if (isSectionVisible('sales') && typeof renderQuickSalesGrid === 'function') renderQuickSalesGrid();
+        });
+    }, err => console.error('settings listener', err));
+
+    // Carica immagini UNA volta (no listener permanente → risparmio enorme su letture/banda)
+    loadItemImagesOnce(false);
+
+    // Ritarda leggermente i listener "pesanti" per non bloccare il first paint
     setTimeout(function () {
         db.collection('custom_stashes').onSnapshot(snapshot => {
             localStashes = {};
@@ -799,6 +863,7 @@ function initDatabaseListeners() {
             });
         });
 
+        // Vendite settimana corrente (dato caldo, real-time necessario)
         db.collection('current_sales').onSnapshot(snapshot => {
             localSales = {};
             snapshot.forEach(doc => { localSales[doc.id] = doc.data(); });
@@ -809,6 +874,7 @@ function initDatabaseListeners() {
             });
         });
 
+        // Inventario (dato caldo)
         db.collection('inventory_items').onSnapshot(snapshot => {
             localInventory = {};
             snapshot.forEach(doc => { localInventory[doc.id] = doc.data(); });
@@ -817,7 +883,8 @@ function initDatabaseListeners() {
             });
         });
 
-        db.collection('inventory_logs').orderBy('timestamp', 'desc').limit(50).onSnapshot(snapshot => {
+        // Log inventario: solo ultimi 40 (prima 50)
+        db.collection('inventory_logs').orderBy('timestamp', 'desc').limit(40).onSnapshot(snapshot => {
             localInventoryLogs = [];
             snapshot.forEach(doc => { localInventoryLogs.push({ id: doc.id, ...doc.data() }); });
             scheduleUI(function () {
@@ -825,7 +892,8 @@ function initDatabaseListeners() {
             });
         });
 
-        db.collection('saldo_movimenti').orderBy('timestamp', 'desc').limit(300).onSnapshot(snapshot => {
+        // Movimenti saldo: ultimi 200 (prima 300) – sufficienti per UI e filtri settimana
+        db.collection('saldo_movimenti').orderBy('timestamp', 'desc').limit(200).onSnapshot(snapshot => {
             localBalanceLogs = [];
             snapshot.forEach(doc => { localBalanceLogs.push({ id: doc.id, ...doc.data() }); });
             scheduleUI(function () {
@@ -833,47 +901,37 @@ function initDatabaseListeners() {
             });
         }, err => console.error('saldo_movimenti listener', err));
 
-        db.collection('archive').onSnapshot(snapshot => {
+        // Archivio: solo le ultime 25 settimane (evita di scaricare anni di storico)
+        db.collection('archive').orderBy('timestamp', 'desc').limit(25).onSnapshot(snapshot => {
             localArchive = {};
             snapshot.forEach(doc => { localArchive[doc.id] = doc.data(); });
             scheduleUI(function () {
                 if (isSectionVisible('sales') && typeof renderSalesArchiveWindow === 'function') renderSalesArchiveWindow(localArchive);
+                if (isSectionVisible('calcolo') && typeof renderCalcoloSection === 'function') renderCalcoloSection();
                 if (isAdminOpen() && typeof renderArchive === 'function') renderArchive(localArchive);
             });
-        });
-
-        
-        db.collection('settings').doc('app').onSnapshot(doc => {
-            if (doc.exists) {
-                const d = doc.data() || {};
-                localSettings.defaultMembroPct = (d.defaultMembroPct != null) ? parseFloat(d.defaultMembroPct) : 40;
-                localSettings.defaultDinastiaPct = (d.defaultDinastiaPct != null) ? parseFloat(d.defaultDinastiaPct) : 40;
-            }
-            scheduleUI(function () {
-                if (typeof applySettingsToAdminUI === 'function') applySettingsToAdminUI();
-                if (isSectionVisible('sales') && typeof renderQuickSalesGrid === 'function') renderQuickSalesGrid();
+        }, err => {
+            // Se manca indice o ordine, fallback senza limit/order (ma preferibile creare indice)
+            console.warn('archive ordered listener failed, fallback plain', err);
+            db.collection('archive').limit(25).onSnapshot(snapshot => {
+                localArchive = {};
+                snapshot.forEach(doc => { localArchive[doc.id] = doc.data(); });
+                scheduleUI(function () {
+                    if (isSectionVisible('sales') && typeof renderSalesArchiveWindow === 'function') renderSalesArchiveWindow(localArchive);
+                    if (isAdminOpen() && typeof renderArchive === 'function') renderArchive(localArchive);
+                });
             });
-        }, err => console.error('settings listener', err));
-
-        db.collection('item_images').onSnapshot(snapshot => {
-            localItemImages = {};
-            snapshot.forEach(doc => { localItemImages[doc.id] = doc.data(); });
-            scheduleUI(function () {
-                if (typeof renderItemImageSelects === 'function') renderItemImageSelects();
-                if (isAdminOpen() && typeof renderItemImagesLibrary === 'function') renderItemImagesLibrary();
-                if (isSectionVisible('inventory') && typeof renderInventoryGrid === 'function') renderInventoryGrid();
-            }, 40);
         });
-    }, 200);
+    }, 180);
 }
 
 // Protezione
-document.addEventListener('contextmenu', event => event.preventDefault());
-document.onkeydown = function(e) {
-    if (e.keyCode == 123) return false;
-    if (e.ctrlKey && e.shiftKey && (e.keyCode == 'I'.charCodeAt(0) || e.keyCode == 'C'.charCodeAt(0) || e.keyCode == 'J'.charCodeAt(0))) return false;
-    if (e.ctrlKey && e.keyCode == 'U'.charCodeAt(0)) return false;
-};
+// document.addEventListener('contextmenu', event => event.preventDefault());
+// document.onkeydown = function(e) {
+//     if (e.keyCode == 123) return false;
+//     if (e.ctrlKey && e.shiftKey && (e.keyCode == 'I'.charCodeAt(0) || e.keyCode == 'C'.charCodeAt(0) || e.keyCode == 'J'.charCodeAt(0))) return false;
+//     if (e.ctrlKey && e.keyCode == 'U'.charCodeAt(0)) return false;
+// };
 
 // --- STASH ---
 function renderStashDropdowns() {
@@ -1041,7 +1099,10 @@ function renderItemImagesLibrary() {
 window.deleteItemImage = function(id) {
     showConfirmModal("Elimina Immagine", "Rimuovere questa immagine dalla libreria?", function () {
         db.collection('item_images').doc(id).delete()
-            .then(function () { showToast("Immagine rimossa.", "info"); })
+            .then(function () {
+                showToast("Immagine rimossa.", "info");
+                if (typeof loadItemImagesOnce === 'function') loadItemImagesOnce(true);
+            })
             .catch(function (err) { showToast(err.message, "error"); });
     }, true);
 };
@@ -1100,8 +1161,11 @@ window.uploadItemImagesFromInput = async function uploadItemImagesFromInput() {
         if (fileInput) fileInput.value = '';
         if (btn) { btn.disabled = false; btn.innerHTML = prevHtml; }
         if (statusEl) statusEl.textContent = ok > 0 ? ('Completato: ' + ok + ' caricate (comresse)' + (skip ? ', ' + skip + ' saltate' : '') + '.') : 'Nessuna immagine nuova caricata.';
-        if (ok > 0) showToast('Caricate ' + ok + ' immagini ottimizzate' + (skip ? ' (' + skip + ' saltate)' : '') + '.', 'success');
-        else if (skip > 0 && fail === 0) showToast('Nessuna nuova immagine (già presenti o non valide).', 'warning');
+        if (ok > 0) {
+            showToast('Caricate ' + ok + ' immagini ottimizzate' + (skip ? ' (' + skip + ' saltate)' : '') + '.', 'success');
+            // Ricarica libreria immagini (una sola lettura) senza listener permanente
+            if (typeof loadItemImagesOnce === 'function') loadItemImagesOnce(true);
+        } else if (skip > 0 && fail === 0) showToast('Nessuna nuova immagine (già presenti o non valide).', 'warning');
         else if (fail > 0) showToast('Caricamento fallito. Vedi console (F12).', 'error');
     } catch (err) {
         console.error('uploadItemImagesFromInput', err);
@@ -1237,6 +1301,8 @@ window.optimizeExistingItemImages = async function optimizeExistingItemImages() 
                     if (statusEl) statusEl.textContent = summary;
                     if (firstPermError) showToast('Permesso negato su item_images. Login gestore obbligatorio.', 'error');
                     else showToast('Ottimizzazione: ' + done + ' immagini · ~' + Math.round(bytesSaved / 1024) + ' KB · ' + invUpdated + ' item', failed ? 'warning' : 'success');
+                    // Ricarica libreria dopo ottimizzazione
+                    if (typeof loadItemImagesOnce === 'function') loadItemImagesOnce(true);
                 })().catch(function (err) {
                     console.error('runOptimize', err);
                     showToast('Errore ottimizzazione: ' + (err && err.message ? err.message : err), 'error');
@@ -1587,7 +1653,13 @@ function renderInventoryGrid() {
     items.forEach(item => {
         const safeName = (item.name || '').replace(/'/g, "\\'").replace(/"/g, '&quot;');
         const delHidden = userRole !== 'gestore' ? 'hidden' : '';
-        const imgSrc = item.imageUrl || 'https://via.placeholder.com/150?text=No+Immagine';
+        // Risolvi immagine da libreria (imageId) oppure fallback legacy imageUrl
+        let imgSrc = 'https://via.placeholder.com/150?text=No+Immagine';
+        if (item.imageId && localItemImages[item.imageId] && localItemImages[item.imageId].dataUrl) {
+            imgSrc = localItemImages[item.imageId].dataUrl;
+        } else if (item.imageUrl) {
+            imgSrc = item.imageUrl; // compatibilità oggetti vecchi
+        }
         const stashLabel = getStashName(item.stash) || '—';
         tpl.innerHTML =
             '<div onclick="openSmartModal(\'inv\', \'' + item.id + '\')" class="relative bg-gray-800 rounded-2xl border border-gray-700 overflow-hidden shadow-lg flex flex-col group cursor-pointer hover:border-amber-500 transition-all inv-card min-h-[200px]">' +
@@ -1656,13 +1728,22 @@ document.getElementById('inventory-admin-form')?.addEventListener('submit', (e) 
     const stash = document.getElementById('inv-admin-stash').value;
     if (!name) { showToast("Inserisci il nome dell'oggetto.", "warning"); return; }
     if (!stash) { showToast("Seleziona un deposito.", "warning"); return; }
-    let imageUrl = 'https://via.placeholder.com/150?text=No+Immagine';
+    // NON salvare più il dataUrl completo nell'item → solo imageId (risparmio enorme su letture/scritture)
+    let imageId = '';
     let imageFileName = '';
     if (imgId && localItemImages[imgId]) {
-        imageUrl = localItemImages[imgId].dataUrl || imageUrl;
+        imageId = imgId;
         imageFileName = localItemImages[imgId].fileName || '';
     }
-    db.collection('inventory_items').add({ name, imageUrl, imageFileName, quantity, stash, createdAt: Date.now() })
+    db.collection('inventory_items').add({
+        name,
+        imageId,
+        imageFileName,
+        quantity,
+        stash,
+        createdAt: Date.now()
+        // legacy imageUrl rimosso di proposito
+    })
         .then(() => { e.target.reset(); document.getElementById('inv-admin-qty').value = 0; showToast("Oggetto creato!", "success"); })
         .catch(err => showToast("Errore salvataggio: " + err.message, "error"));
 });
@@ -1925,9 +2006,15 @@ function archiveCurrentWeek() {
         salariesReport: finalMembriSalariesReport
     };
 
-    db.collection('archive').add(archiveData).then(() => {
-        Object.keys(localSales).forEach(sk => db.collection('current_sales').doc(sk).delete());
-        // no salaries status
+    db.collection('archive').add(archiveData).then(async () => {
+        // Batch delete (max 500 ops per batch) → meno round-trip e meno rischio rate-limit
+        const ids = Object.keys(localSales);
+        const CHUNK = 450;
+        for (let i = 0; i < ids.length; i += CHUNK) {
+            const batch = db.batch();
+            ids.slice(i, i + CHUNK).forEach(sk => batch.delete(db.collection('current_sales').doc(sk)));
+            await batch.commit();
+        }
         if (adminEmployeeFilter) adminEmployeeFilter.value = "all";
         showToast("Settimana archiviata e bilanci azzerati!", "success");
     }).catch(err => showToast(err.message, "error"));
@@ -1955,11 +2042,14 @@ document.getElementById('archive-single-employee-btn')?.addEventListener('click'
         Object.keys(singleSales).forEach(sk => { report[empKey].salary += singleSales[sk].employeeGain || 0; });
         db.collection('archive').add({
             title: archiveTitle, timestamp: Date.now(), sales: singleSales, salariesReport: report
-        }).then(() => {
-            Object.keys(localSales).forEach(sk => {
-                if (localSales[sk].employeeKey === empKey) db.collection('current_sales').doc(sk).delete();
-            });
-            // no salaries status
+        }).then(async () => {
+            const ids = Object.keys(singleSales);
+            const CHUNK = 450;
+            for (let i = 0; i < ids.length; i += CHUNK) {
+                const batch = db.batch();
+                ids.slice(i, i + CHUNK).forEach(sk => batch.delete(db.collection('current_sales').doc(sk)));
+                await batch.commit();
+            }
             if (adminEmployeeFilter) adminEmployeeFilter.value = "all";
             showToast(`Settimana di ${empName} archiviata!`, "success");
         }).catch(err => showToast(err.message, "error"));
